@@ -1,3 +1,6 @@
+import re
+from collections import defaultdict
+
 def splitLines(path):
     def getLines(ptr, eptr):
         ptr = eptr + 1
@@ -47,7 +50,7 @@ def splitLines(path):
     return linesDict
 
 def tableParser(strList):
-    childMap = dict()
+    childMap = defaultdict(list) # {parentNodeId : [childNodeId1, childNodeId2, ...]}
     titleList = list(map(lambda s:s.strip(), 
                          strList[0].split('|')))
 
@@ -56,60 +59,135 @@ def tableParser(strList):
         pos = info.index('-')
         plan['depth'] = pos // 3
         info = info[pos+2:].strip()
-
-        if 'Stream' in info:
-            streamType, dopInfo = info.replace('(type:','').split('dop:')
-            plan['Node Type'] = streamType.strip()
-            plan['Dop'] = eval('('+dopInfo.replace('/',','))
-            return
+        curId = plan['Node Id']
+        # TPC-DS has several types of node, we split them to 4 types
+        # has()has[]
+        #   Row Adatper [parentId, InitPlan initPlanId(returns $)]  # Row Adapter  [100, InitPlan 5 (returns $6)]
+        #   Op [parentId, CTE alias(cteId)] # Vector Aggregate  [39, CTE avg_sales(1)]
+        #   Join Op (childId1, childId2) [parentId, CTE alias(cteId)] # Vector Hash Aggregate  [10, CTE customer_total_return(0)]
+        #   Subquery Scan on Alias [parentId, CTE alias(cteId)] # Vector Subquery Scan on "*SELECT* 0" [21, CTE *year_total* 1(0)]
+        #   
+        # has()no[]
+        #   Scan on tbl(DRIVE) # CStore Scan on catalog_scales(DRIVE)
+        #   CTE Scan on medColName(cteId) # 
+        #   CTE Scan on medColName(cteId) alias # CTE Scan on all_sales(0) curr_yr
+        #   Join Op (child1, child2)
+        #   Append Op (child1, child2, ..)
+        #   Stream Op (type: ..)
+        #   Stream Op (type: .. dop: n/m)
+        #
+        # no() has[]
+        #   Row Adapter [parentId, SubPlan subplanId]
+        #
+        # no() no[]
+        #   Index Op using indexKey on colName
+        #   Scan Op on colName
+        #   Scan Op on colName alias
+        #   Subquery Scan on medColName
+        #   Op
         
-        elif 'Scan' in info:
-            ndType, scanTbl = info.split(' on ')
-            if 'Subquery' in ndType:
-                plan['Node Type'] = ndType
-                plan['Subquery Column'] = scanTbl
-            elif 'Index' in ndType:
-                ndType, usingIndex = ndType.split(' using ')
-                plan['Node Type'] = ndType
-                plan['Using Index'] = usingIndex
-                plan['Relation Name'] = scanTbl.replace('public.', '')
-            else:
-                plan['Node Type'] = ndType
-                plan['Relation Name'] = scanTbl.replace('public.', '')
-            return
-        
-        elif ' [' in info: # InitPlan or CTEPlan
+        if '(' in info and '[' in info:
+            #   Row Adatper [parentId, InitPlan initPlanId(returns $)]
+            #   Op [parentId, CTE alias(cteId)]
+            #   Join Op (childId1, childId2) [parentId, CTE alias(cteId)]
+            #   Subquery Scan on Alias [parentId, CTE alias(cteId)]
             if 'InitPlan' in info:
-                ndType, info = info.split('[')
-                plan['Node Type'] = ndType.strip()
-                parentId, info = info.split(', ')
-                curId = plan['Node Id']
-                parentId = int(parentId)
+                # info = 'Row Adapter  [4, InitPlan 13 (returns $12)]'
+                reFind = re.findall(r'(\D+)\[(\d+), InitPlan (\d+) \(returns \$(\d+)\)\]', info)[0]
+                ndtype, parentId, initPlanId, _ = reFind
+                plan['Node Type'] = ndtype.strip()
+                childMap[parentId].append(curId)
 
-                if childMap.get(parentId, False):
-                    childMap[parentId].append(curId)
-                else:
-                    childMap[parentId] = [curId]
-                return
+
+
             elif 'CTE' in info:
-                raise('CTE not support')
-            else:
-                raise('Strange Type [...] info')
-        
-        elif ' (' in info:
-            pos = info.index('(')
-            plan['Node Type'] = info[:pos].strip()
-            curId = plan['Node Id']
-            for childId in eval(info[pos:]):
-                if childMap.get(curId, False): 
-                    childMap[curId].append(childId)
+                ndInfo, _,  cteinfo = info.partition('[')
+                if '(' in ndInfo:
+                    ndtype, _, chInfo = ndInfo.partition('(')
+                    chId1, chId2 = map(int, re.findall(r'(\d+)', chInfo))
+                    childMap[curId] += [chId1, chId2]
+
+                elif 'on' in ndInfo:
+                    ndtype = ndInfo.partition('on')
+
                 else:
-                    childMap[curId] = [childId]
-            return
-        
+                    ndtype = ndInfo
+                plan['Node Type'] = ndtype.strip()
+                parentId, cteId = map(int, re.findall(r'(\d+)', cteinfo))
+                childMap[parentId].append(curId)
+                plan['CTE Id'] = cteId
+                
+            else:
+                raise ValueError('Strange Node Type. # has()has[] type')
+            
+        elif '(' in info and '[' not in info:
+            if 'CTE' in info:
+            #   CTE Scan on medColName(cteId) # 
+            #   CTE Scan on medColName(cteId) alias # CTE Scan on all_sales(0) curr_yr
+                ndtype, _, cteinfo = info.partition('on')
+                cteId = int(re.search(r'(\d+)', cteinfo).group(1))
+                plan['Node Type'] = ndtype.strip()
+                plan['CTE Id'] = cteId
+            elif 'Stream' in info:
+            #   Stream Op (type: ..)
+            #   Stream Op (type: .. dop: n/m)
+                ndinfo1, _, streaminfo = info.partition('(type:')
+                if 'dop' in streaminfo:
+                    ndinfo2, _, dopinfo = streaminfo.partition('dop:')
+
+                    doplist = list(map(int, re.findall(r'(\d+)', dopinfo)))
+                else:
+                    ndinfo2 = streaminfo.partition(')')[0]
+                    doplist = [1, 1]
+                plan['Node Type'] = ndinfo1.strip() + ' ' + ndinfo2.strip()
+                plan['Dop'] = doplist
+            
+            elif 'on' in info:
+            #   Scan on tbl(DRIVE) # CStore Scan on catalog_scales(DRIVE)
+                ndtype, _, tblinfo = info.partition('on')
+                tbl = tblinfo.partition('(')[0]
+                plan['Node Type'] = ndtype.strip()
+                plan['Relation Name'] = tbl.strip()
+            
+            else:
+            #   Join Op (child1, child2)
+            #   Append Op (child1, child2, ..)
+                ndtype, _, chinfo = info.partition('(')
+                plan['Node Type'] = ndtype.strip()
+                childMap[curId] = list(map(int, re.findall(r'(\d+)', chinfo)))
+
+        elif '(' not in info and '[' in info:
+        #   Row Adapter [parentId, SubPlan subplanId]
+            ndtype, _, adpinfo = info.partition('[')
+            parentId, subplanId = map(int, re.findall(r'(\d+)', adpinfo))
+            plan['Node Type'] = ndtype.strip()
+            plan['Subplan Id'] = subplanId
+            childMap[parentId].append(curId)
+
         else:
-            plan['Node Type'] = info
-            return 
+            if 'using' in info:
+            #   Index Op using indexKey on colName
+                ndtype, _, elseinfo = info.partition('using')
+                idxkey, _, tbl = elseinfo.partition('on')
+                plan['Node Type'] = ndtype.strip()
+                plan['Index Key'] = idxkey.strip()
+                plan['Relation Name'] = tbl.strip()
+            elif 'on' in info:
+            #   Scan Op on colName
+            #   Scan Op on colName alias
+            #   Subquery Scan on medColName
+                ndtype, _, tblinfo = info.partition('on')
+                tbl = tblinfo.strip().partition(' ')[0]
+                plan['Node Type'] = ndtype.strip()
+                plan['Relation Name'] = tbl.strip()
+
+            else:
+            #   Op
+                plan['Node Type'] = info.strip()
+
+        
+
+        
 
     # gen plan list
     planList = [None]
